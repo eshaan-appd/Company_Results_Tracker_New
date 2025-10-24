@@ -1,8 +1,9 @@
 # app.py
-# Streamlit app: deterministic extraction of Consolidated P&L (Quarter), Balance Sheet, Cash Flow from BSE PDFs
-# Replaces LLM parsing to prevent column mis-mapping (e.g., mixing quarter vs. H1).
+# Streamlit app that extracts Consolidated P&L (Quarter), Balance Sheet, and Cash Flow
+# from BSE PDFs using ONLY OpenAI (no Camelot/Ghostscript). The model returns strict JSON
+# under a schema; we verify tallies locally and render markdown + Excel.
 
-import os, re, io, time, tempfile, math
+import os, re, io, time, json, tempfile
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -10,24 +11,24 @@ import requests
 import streamlit as st
 import pandas as pd
 import numpy as np
-import camelot
 from openpyxl import Workbook
+from openai import OpenAI
 
 # ===============================
 # Streamlit UI
 # ===============================
-st.set_page_config(page_title="📈 Listed Company Results Tracker (Deterministic)", layout="wide")
-st.title("📈 Listed Company Results Tracker — Deterministic Tables (INR Cr)")
+st.set_page_config(page_title="📈 BSE Results — OpenAI-only Extractor", layout="wide")
+st.title("📈 BSE Results — OpenAI-only Extractor (INR Cr)")
 
 st.caption(
-    "Fetch BSE ‘Result’ announcements → parse PDF tables with Camelot → show Consolidated P&L (Quarter), "
-    "Balance Sheet, and Cash Flow with unit normalization and tie-out checks."
+    "Fetch BSE ‘Result’ announcements → upload the PDF to OpenAI → model returns strict JSON for "
+    "Consolidated P&L (Quarter), Balance Sheet, and Cash Flow. We re-check tallies locally."
 )
 
 # ===============================
 # Small utilities
 # ===============================
-def _fmt(d: datetime.date) -> str:
+def _fmt_date(d: datetime.date) -> str:
     return d.strftime("%Y%m%d")
 
 def _norm(s):
@@ -39,13 +40,27 @@ def _first_col(df: pd.DataFrame, names):
             return n
     return None
 
-_ILLEGAL_RX = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
-def _clean(s: str) -> str:
-    return _ILLEGAL_RX.sub('', s) if isinstance(s, str) else s
-
 def _slug(s: str, maxlen: int = 60) -> str:
     s = re.sub(r"[^A-Za-z0-9]+", "_", str(s or "")).strip("_")
     return (s[:maxlen] if len(s) > maxlen else s) or "file"
+
+def _xlsx_bytes(sheets: dict) -> bytes:
+    with pd.ExcelWriter(io.BytesIO(), engine="openpyxl") as xw:
+        for name, frame in sheets.items():
+            if isinstance(frame, pd.DataFrame):
+                frame.to_excel(xw, name[:31], index=False)
+            else:
+                pd.DataFrame([frame]).to_excel(xw, name[:31], index=False)
+        xw.book.save(xw._io)
+        return xw._io.getvalue()
+
+def _to_markdown(df: pd.DataFrame) -> str:
+    return df.fillna("").to_markdown(index=False)
+
+def _pct(curr, base):
+    if pd.isna(curr) or pd.isna(base) or base == 0:
+        return np.nan
+    return (curr - base) / abs(base) * 100.0
 
 # ===============================
 # BSE API fetch (Result category)
@@ -89,7 +104,6 @@ def fetch_bse_announcements_result(start_yyyymmdd: str,
     except Exception:
         pass
 
-    # Variants to bypass occasional BSE API quirks
     variants = [
         {"subcategory": "-1", "strSearch": "P"},
         {"subcategory": "-1", "strSearch": ""},
@@ -160,363 +174,382 @@ def _download_pdf(url: str, timeout=25) -> bytes:
     return r.content
 
 # ===============================
-# Deterministic PDF parsing (Camelot)
+# OpenAI — strict JSON extractor
 # ===============================
-NEEDLE_PNL   = re.compile(r"(statement of (consolidated )?(audited )?financial results|statement of profit|profit\s*&\s*loss|income statement)", re.I)
-NEEDLE_BAL   = re.compile(r"(statement of assets|assets\s*&\s*liabilities|balance\s*sheet)", re.I)
-NEEDLE_CASH  = re.compile(r"(cash\s*flow\s*statement|statement of cash flows)", re.I)
-NEEDLE_CONS  = re.compile(r"\bconsolidated\b", re.I)
-UNIT_RX      = re.compile(r"(₹|rs\.?)\s*(in)?\s*(crore|cr|lakhs|lakh|mn|million|bn|billion)", re.I)
+def _client():
+    key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+    if not key:
+        st.error("Missing OPENAI_API_KEY (env var or Streamlit secrets).")
+        st.stop()
+    return OpenAI(api_key=key)
 
-def _detect_unit_multiplier(text: str) -> float:
-    m = UNIT_RX.search(text or "")
-    if not m: return 1.0
-    unit = m.group(3).lower()
+def _schema():
+    # JSON Schema demanding exact structure. Model MUST fill it.
     return {
-        "crore": 1.0, "cr": 1.0,
-        "lakhs": 0.01, "lakh": 0.01,
-        "mn": 0.1, "million": 0.1,
-        "bn": 100.0, "billion": 100.0
-    }.get(unit, 1.0)
-
-def _parse_number(x):
-    if x is None:
-        return np.nan
-    s = str(x).strip().replace("\u2212","-").replace(",","")
-    if s in ["","-","—","NA","N.A.","Not Applicable","not applicable"]:
-        return np.nan
-    neg = s.startswith("(") and s.endswith(")")
-    s = s.replace("(","").replace(")","")
-    try:
-        v = float(s)
-        return -v if neg else v
-    except:
-        return np.nan
-
-def _camelot_tables(pdf_bytes):
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-        f.write(pdf_bytes)
-        path = f.name
-    try:
-        t = camelot.read_pdf(path, pages="all", flavor="lattice")
-        if t.n == 0: raise RuntimeError("no lattice tables")
-    except Exception:
-        t = camelot.read_pdf(path, pages="all", flavor="stream")
-    return t
-
-def _unit_multiplier_from_all(tables) -> float:
-    blob = " ".join(" ".join(tb.df.astype(str).values.ravel()) for tb in tables)
-    return _detect_unit_multiplier(blob)
-
-def _choose_table(tables, rx_header):
-    picks = []
-    for tb in tables:
-        text = " ".join(tb.df.astype(str).values.ravel())
-        if rx_header.search(text):
-            picks.append(tb.df)
-    if not picks:
-        return None
-    for df in picks:
-        text = " ".join(df.astype(str).values.ravel())
-        if NEEDLE_CONS.search(text):
-            return df
-    return picks[0]
-
-def _find_header_row(df):
-    # pick a row that contains "Particulars" or looks like "Particulars | As at ..."
-    for i in range(min(8, len(df))):
-        rowtxt = " ".join(df.iloc[i].astype(str).values).lower()
-        if "particular" in rowtxt or "as at" in rowtxt or "as at" in rowtxt.replace("."," "):
-            return i
-    return 0
-
-def _numeric_columns(df):
-    cols = []
-    for c in df.columns[1:]:
-        nums = sum(pd.notna(df[c].map(_parse_number)))
-        if nums >= max(3, int(0.15*len(df))):
-            cols.append(c)
-    return cols
-
-def _pick_quarter_columns(df_raw):
-    """
-    For P&L: choose the first three numeric columns after 'Particulars',
-    preferring those whose category (previous row above header) says 'Quarter ended'
-    (if that row exists). Fallback to first three numeric columns.
-    """
-    df = df_raw.copy()
-    hdr_idx = _find_header_row(df)
-    # try to capture category row above
-    cat_row = df.iloc[hdr_idx-1] if hdr_idx > 0 else None
-    df.columns = df.iloc[hdr_idx].tolist()
-    df = df.iloc[hdr_idx+1:].reset_index(drop=True)
-    first_col = df.columns[0]
-    df.rename(columns={first_col: "Particulars"}, inplace=True)
-
-    # drop empty cols; find numeric ones
-    num_cols = _numeric_columns(df)
-
-    # preference for "Quarter ended" if cat_row exists
-    def _is_quarter(c):
-        if cat_row is None: return False
-        s = str(cat_row.get(c, "")) if isinstance(cat_row, pd.Series) else ""
-        s = str(s).lower()
-        return ("quarter" in s) or ("3 months" in s) or ("three months" in s)
-
-    quarter_cols = [c for c in num_cols if _is_quarter(c)]
-    pick = (quarter_cols[:3] if len(quarter_cols) >= 3 else num_cols[:3])
-
-    # build user-friendly date labels
-    labels = []
-    for c in pick:
-        s = str(c)
-        m = re.search(r"(\d{1,2}[-/ ]?(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[-/ ]?\d{2,4})", s, re.I)
-        labels.append(m.group(1) if m else s)
-    return df[["Particulars"] + pick].copy(), labels
-
-def _to_markdown(df: pd.DataFrame) -> str:
-    # Replace NaN with blank for a clean table
-    return df.fillna("").to_markdown(index=False)
-
-def _xlsx_bytes(sheets: dict) -> bytes:
-    # sheets: {sheet_name: DataFrame}
-    with pd.ExcelWriter(io.BytesIO(), engine="openpyxl") as xw:
-        for name, frame in sheets.items():
-            if isinstance(frame, pd.DataFrame):
-                frame.to_excel(xw, name[:31], index=False)
-            else:
-                # write small meta dicts
-                pd.DataFrame([frame]).to_excel(xw, name[:31], index=False)
-        xw.book.save(xw._io)
-        return xw._io.getvalue()
-
-# ===============================
-# High-level parse for 3 statements
-# ===============================
-def extract_financials_from_pdf(pdf_bytes: bytes) -> dict:
-    tables = _camelot_tables(pdf_bytes)
-    if tables.n == 0:
-        raise RuntimeError("No tables detected in PDF.")
-    unit_mult = _unit_multiplier_from_all(tables)
-
-    # ---- P&L (Quarter) ----
-    pnl_df_raw = _choose_table(tables, NEEDLE_PNL)
-    pnl_md = None
-    pnl_issues = []
-    pnl_sheet = None
-    pnl_labels = []
-    if pnl_df_raw is not None:
-        pnl_quarters, pnl_labels = _pick_quarter_columns(pnl_df_raw)
-        # coerce
-        for c in pnl_quarters.columns[1:]:
-            pnl_quarters[c] = pnl_quarters[c].map(_parse_number) * unit_mult
-
-        def _find(label_regex):
-            ix = pnl_quarters["Particulars"].astype(str).str.replace(r"\s+"," ",regex=True).str.strip()
-            hit = ix.str.contains(label_regex, case=False, regex=True, na=False)
-            return pnl_quarters.loc[hit].head(1)
-
-        def _val(label, col):
-            df = _find(label)
-            if df.empty: return np.nan
-            v = df.iloc[0][col]
-            return float(v) if pd.notna(v) else np.nan
-
-        latest, prev, yoy = pnl_quarters.columns[1], pnl_quarters.columns[2], pnl_quarters.columns[3]
-        # totals & checks
-        rev_c = _val(r"^revenue\s*from\s*operations", latest)
-        oth_c = _val(r"^other\s*income", latest)
-        tin_c = _val(r"^total\s*income", latest)
-        if all(pd.notna([rev_c, oth_c, tin_c])) and abs((rev_c+oth_c) - tin_c) > max(0.5, 0.005*max(abs(tin_c),1)):
-            pnl_issues.append(f"P&L: Revenue ({rev_c:.2f}) + Other income ({oth_c:.2f}) != Total income ({tin_c:.2f})")
-
-        # computed EBITDA = PBT + Dep + Fin
-        pbt_c = _val(r"(profit|loss)\s*before\s*tax|pbt", latest)
-        dep_c = _val(r"depreciation|amortis", latest)
-        fin_c = _val(r"finance\s*cost", latest)
-        ebitda_c = np.nan if any(pd.isna([pbt_c, dep_c, fin_c])) else pbt_c + dep_c + fin_c
-
-        def _pct(curr, base):
-            if pd.isna(curr) or pd.isna(base) or base == 0:
-                return np.nan
-            return (curr - base) / abs(base) * 100.0
-
-        # also compute EBITDA for prev/yoy if possible (for margins/%Δ)
-        pbt_p = _val(r"(profit|loss)\s*before\s*tax|pbt", prev)
-        dep_p = _val(r"depreciation|amortis", prev)
-        fin_p = _val(r"finance\s*cost", prev)
-        ebitda_p = np.nan if any(pd.isna([pbt_p, dep_p, fin_p])) else pbt_p + dep_p + fin_p
-
-        pbt_y = _val(r"(profit|loss)\s*before\s*tax|pbt", yoy)
-        dep_y = _val(r"depreciation|amortis", yoy)
-        fin_y = _val(r"finance\s*cost", yoy)
-        ebitda_y = np.nan if any(pd.isna([pbt_y, dep_y, fin_y])) else pbt_y + dep_y + fin_y
-
-        def _row(label_regex, nice_label):
-            c = _val(label_regex, latest); p = _val(label_regex, prev); y = _val(label_regex, yoy)
-            return [nice_label,
-                    None if pd.isna(c) else round(c,2),
-                    None if pd.isna(p) else round(p,2),
-                    None if pd.isna(y) else round(y,2),
-                    None if any(pd.isna([c,y])) else round(_pct(c,y),1),
-                    None if any(pd.isna([c,p])) else round(_pct(c,p),1)]
-
-        out = []
-        out.append(_row(r"^revenue\s*from\s*operations", "Revenue from operations"))
-        out.append(_row(r"^other\s*income", "Other income"))
-        out.append(_row(r"^total\s*income", "Total income"))
-        out.append(_row(r"materials\s*consumed", "Cost of materials consumed"))
-        out.append(_row(r"stock-?in-?trade", "Purchases of stock-in-trade"))
-        out.append(_row(r"changes\s*in\s*inventor", "Changes in inventories of FG/WIP/stock-in-trade"))
-        out.append(_row(r"employee\s*benefit", "Employee benefits expense"))
-        out.append(_row(r"^other\s*expenses$", "Other expenses"))
-
-        # EBITDA + margin
-        def _margin(val_num, base_rev):
-            if pd.isna(val_num) or pd.isna(base_rev) or base_rev == 0:
-                return np.nan
-            return (val_num/base_rev)*100.0
-
-        m_curr = _margin(ebitda_c, rev_c)
-        m_prev = _margin(ebitda_p, _val(r"^revenue\s*from\s*operations", prev))
-        m_yoy  = _margin(ebitda_y, _val(r"^revenue\s*from\s*operations", yoy))
-
-        def _bps(a,b):
-            if pd.isna(a) or pd.isna(b): return np.nan
-            return round((a-b)*100)
-
-        out.append([
-            "EBITDA (computed)",
-            None if pd.isna(ebitda_c) else round(ebitda_c,2),
-            None if pd.isna(ebitda_p) else round(ebitda_p,2),
-            None if pd.isna(ebitda_y) else round(ebitda_y,2),
-            None if any(pd.isna([ebitda_c, ebitda_y])) else round(_pct(ebitda_c, ebitda_y),1),
-            None if any(pd.isna([ebitda_c, ebitda_p])) else round(_pct(ebitda_c, ebitda_p),1)
-        ])
-
-        out.append([
-            "EBITDA margin (%)",
-            None if pd.isna(m_curr) else round(m_curr,1),
-            None if pd.isna(m_prev) else round(m_prev,1),
-            None if pd.isna(m_yoy) else round(m_yoy,1),
-            None if any(pd.isna([m_curr, m_yoy])) else f"{_bps(m_curr, m_yoy)} bps",
-            None if any(pd.isna([m_curr, m_prev])) else f"{_bps(m_curr, m_prev)} bps",
-        ])
-
-        out += [
-            _row(r"finance\s*cost", "Finance costs"),
-            _row(r"depreciation|amortis", "Depreciation and amortisation expense"),
-            _row(r"(profit|loss)\s*before\s*tax|pbt", "Profit before tax (PBT)"),
-            _row(r"tax\s*expense|current\s*tax", "Tax expense"),
-            _row(r"(profit|loss)\s*after\s*tax|pat", "Profit after tax (PAT)"),
-        ]
-
-        md_cols = ["Line item",
-                   f"{pnl_labels[0]} (INR Cr)",
-                   f"{pnl_labels[1]} (INR Cr)",
-                   f"{pnl_labels[2]} (INR Cr)",
-                   "%YoY","%QoQ"]
-
-        pnl_sheet = pd.DataFrame(out, columns=md_cols)
-        pnl_md = _to_markdown(pnl_sheet)
-
-    # ---- Balance Sheet ----
-    bal_df_raw = _choose_table(tables, NEEDLE_BAL)
-    bal_md = None
-    bal_issues = []
-    bal_sheet = None
-    if bal_df_raw is not None:
-        df = bal_df_raw.copy()
-        hdr_idx = _find_header_row(df)
-        df.columns = df.iloc[hdr_idx].tolist()
-        df = df.iloc[hdr_idx+1:].reset_index(drop=True)
-        first_col = df.columns[0]
-        df.rename(columns={first_col: "Line item"}, inplace=True)
-        # pick first 2 numeric columns (As at dates), sometimes 3 exist (latest, prev FY, prior FY)
-        num_cols = _numeric_columns(df)
-        pick = num_cols[:2] if len(num_cols) >= 2 else num_cols
-        # coerce
-        for c in pick:
-            df[c] = df[c].map(_parse_number) * unit_mult
-        # tie-out
-        def _find_row(rx):
-            ix = df["Line item"].astype(str).str.lower()
-            hit = ix.str.contains(rx, regex=True, na=False)
-            return df.loc[hit].head(1)
-        ta = _find_row(r"total\s*assets$")
-        tel = _find_row(r"total\s*(equity.*liabilit|liabilities\s*&\s*equity)")
-        if not ta.empty and not tel.empty:
-            for c in pick:
-                a = ta.iloc[0][c]; b = tel.iloc[0][c]
-                if pd.notna(a) and pd.notna(b):
-                    if abs(a - b) > max(0.5, 0.005*max(abs(a),abs(b))):
-                        bal_issues.append(f"Balance Sheet mismatch in {c}: Total Assets ({a:.2f}) vs Total Equity & Liabilities ({b:.2f})")
-        # keep trimmed sheet
-        bal_sheet = df[["Line item"] + pick].copy()
-        bal_md = _to_markdown(bal_sheet)
-
-    # ---- Cash Flow ----
-    cash_df_raw = _choose_table(tables, NEEDLE_CASH)
-    cash_md = None
-    cash_issues = []
-    cash_sheet = None
-    if cash_df_raw is not None:
-        df = cash_df_raw.copy()
-        hdr_idx = _find_header_row(df)
-        df.columns = df.iloc[hdr_idx].tolist()
-        df = df.iloc[hdr_idx+1:].reset_index(drop=True)
-        first_col = df.columns[0]
-        df.rename(columns={first_col: "Line item"}, inplace=True)
-        num_cols = _numeric_columns(df)
-        pick = num_cols[:3] if len(num_cols) >= 3 else num_cols  # keep up to three period columns
-        for c in pick:
-            df[c] = df[c].map(_parse_number) * unit_mult
-
-        def _rowval(rx, col):
-            hit = df["Line item"].astype(str).str.contains(rx, case=False, regex=True, na=False)
-            if not df.loc[hit].empty:
-                v = df.loc[hit].iloc[0][col]
-                return float(v) if pd.notna(v) else np.nan
-            return np.nan
-
-        # sanity: CFO+CFI+CFF = Net change; Opening + Net change = Closing
-        for c in pick:
-            cfo = _rowval(r"(net\s*cash.*operat|cash\s*flow.*operat)", c)
-            cfi = _rowval(r"(net\s*cash.*invest|cash\s*flow.*invest)", c)
-            cff = _rowval(r"(net\s*cash.*financ|cash\s*flow.*financ)", c)
-            net = _rowval(r"(net\s*increase.*decrease.*cash|net\s*change.*cash)", c)
-            if not any(pd.isna([cfo, cfi, cff, net])):
-                calc = cfo + cfi + cff
-                if abs(calc - net) > max(0.5, 0.02*max(abs(calc),abs(net))):
-                    cash_issues.append(f"{c}: CFO({cfo:.2f}) + CFI({cfi:.2f}) + CFF({cff:.2f}) = {calc:.2f} ≠ Net change({net:.2f})")
-            opn = _rowval(r"(cash.*at\s*the\s*beginning|opening\s*cash)", c)
-            cls = _rowval(r"(cash.*at\s*the\s*end|closing\s*cash)", c)
-            if not any(pd.isna([opn, net, cls])):
-                if abs(opn + net - cls) > max(0.5, 0.02*max(abs(opn+net),abs(cls))):
-                    cash_issues.append(f"{c}: Opening({opn:.2f}) + Net({net:.2f}) ≠ Closing({cls:.2f})")
-
-        cash_sheet = df[["Line item"] + pick].copy()
-        cash_md = _to_markdown(cash_sheet)
-
-    return {
-        "unit_multiplier_to_INR_crore": unit_mult,
-        "pnl_sheet": pnl_sheet, "pnl_md": pnl_md, "pnl_issues": pnl_issues, "pnl_labels": pnl_labels,
-        "bal_sheet": bal_sheet, "bal_md": bal_md, "bal_issues": bal_issues,
-        "cash_sheet": cash_sheet, "cash_md": cash_md, "cash_issues": cash_issues,
+      "name": "FinancialExtraction",
+      "strict": True,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "meta": {
+            "type": "object",
+            "properties": {
+              "source_url": {"type": "string"},
+              "company": {"type": "string"},
+              "basis": {"type": "string", "enum": ["Consolidated","Standalone"]},
+              "unit_detected": {"type": "string"},
+              "unit_to_inr_crore": {"type": "number"},
+              "periods": {
+                "type": "object",
+                "properties": {
+                  "pnl": {
+                    "type": "object",
+                    "properties": {
+                      "latest_label": {"type": "string"},
+                      "prev_label":   {"type": "string"},
+                      "yoy_label":    {"type": "string"}
+                    },
+                    "required": ["latest_label","prev_label","yoy_label"]
+                  },
+                  "balance": {
+                    "type": "object",
+                    "properties": {
+                      "asof_latest": {"type": "string"},
+                      "asof_prev":   {"type": "string"},
+                      "asof_yoy":    {"type": "string"}
+                    },
+                    "required": ["asof_latest","asof_prev","asof_yoy"]
+                  },
+                  "cashflow": {
+                    "type": "object",
+                    "properties": {
+                      "basis": {"type": "string", "enum": ["quarter","ytd","h1","9m","year"]},
+                      "latest_label": {"type": "string"},
+                      "prev_label":   {"type": "string"},
+                      "yoy_label":    {"type": "string"}
+                    },
+                    "required": ["basis","latest_label"]
+                  }
+                },
+                "required": ["pnl","balance","cashflow"]
+              }
+            },
+            "required": ["source_url","basis","unit_detected","unit_to_inr_crore","periods"]
+          },
+          "tables": {
+            "type": "object",
+            "properties": {
+              "pnl": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": {"type": "string"},
+                    "latest": {"type": "number"},
+                    "prev":   {"type": ["number","null"]},
+                    "yoy":    {"type": ["number","null"]},
+                    "cell_refs": {
+                      "type": "object",
+                      "properties": {
+                        "latest": {"type": "string"},
+                        "prev":   {"type": "string"},
+                        "yoy":    {"type": "string"}
+                      }
+                    }
+                  },
+                  "required": ["name","latest"]
+                }
+              },
+              "balance": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": {"type":"string"},
+                    "asof_latest": {"type":"number"},
+                    "asof_prev":   {"type":["number","null"]},
+                    "asof_yoy":    {"type":["number","null"]},
+                    "cell_refs": {"type":"object"}
+                  },
+                  "required": ["name","asof_latest"]
+                }
+              },
+              "cashflow": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": {"type":"string"},
+                    "latest": {"type":"number"},
+                    "prev":   {"type":["number","null"]},
+                    "yoy":    {"type":["number","null"]},
+                    "cell_refs": {"type":"object"}
+                  },
+                  "required": ["name","latest"]
+                }
+              }
+            },
+            "required": ["pnl"]
+          },
+          "checks": {
+            "type": "object",
+            "properties": {
+              "pnl": {"type":"array","items":{"type":"string"}},
+              "balance": {"type":"array","items":{"type":"string"}},
+              "cashflow": {"type":"array","items":{"type":"string"}}
+            },
+            "required": ["pnl","balance","cashflow"]
+          },
+          "notes": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["meta","tables","checks"]
+      }
     }
 
+def _openai_extract(pdf_bytes: bytes, source_url: str, company_hint: str, model_name: str):
+    client = _client()
+    # upload file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        tmp.flush()
+        f = client.files.create(file=open(tmp.name, "rb"), purpose="assistants")
+
+    schema = _schema()
+
+    system_msg = (
+        "You are a meticulous financial table extractor. Read the attached BSE results PDF and output ONLY JSON "
+        "matching the provided schema. Prefer CONSOLIDATED; if a statement is missing in consolidated but present in "
+        "standalone, set basis='Standalone' for that statement and use it.\n\n"
+        "IMPORTANT RULES (do not violate):\n"
+        "1) INCOME STATEMENT: Use the three 'QUARTER ENDED' columns ONLY (latest quarter, immediately preceding quarter, same quarter last year). "
+        "   Ignore any 'Six months ended', 'Nine months ended', or 'Year ended' columns for the P&L table.\n"
+        "2) BALANCE SHEET: Use the 'AS AT' columns (pick latest and nearest previous 'as at' dates; include a YoY 'as at' if present).\n"
+        "3) CASH FLOW: Detect the basis (quarter / YTD / H1 / 9M / year) as printed for the section and use 1–3 periods accordingly.\n"
+        "4) UNITS: Detect the unit hint text (e.g., '₹ in Crores', '₹ in Lakhs', '₹ in Million/Billion') and normalize ALL numeric outputs to INR Crore. "
+        "   Set unit_to_inr_crore appropriately: Crore=1, Lakh=0.01, Mn=0.1, Bn=100.\n"
+        "5) LINE ITEMS: Use exact company labels where possible but map to these canonical rows when present:\n"
+        "   - Revenue from operations\n   - Other income\n   - Total income\n"
+        "   - Cost of materials consumed; Purchases of stock-in-trade; Changes in inventories of FG/WIP/stock-in-trade\n"
+        "   - Employee benefits expense; Other expenses\n"
+        "   - Finance costs; Depreciation and amortisation expense\n"
+        "   - Profit before tax (PBT); Tax expense; Profit after tax (PAT)\n"
+        "6) PROVIDE cell_refs strings like 'row label ~ col header' to show where each number came from.\n"
+        "7) TALLY before you return:\n"
+        "   - P&L: check (Revenue + Other income) ≈ Total income (tolerance: max(0.5 Cr, 0.5%)).\n"
+        "   - Balance Sheet: Total Assets ≈ Total Equity & Liabilities (same tolerance).\n"
+        "   - Cash Flow: CFO + CFI + CFF ≈ Net change; Opening + Net change ≈ Closing (tolerance: max(0.5 Cr, 2%)).\n"
+        "   Put any failures as human-readable strings into the respective checks arrays.\n"
+        "8) NEVER fabricate numbers. If a row is missing, omit it. If a comparator period is missing, set that field to null.\n"
+        "Output ONLY JSON — no markdown, no prose."
+    )
+
+    user_payload = {
+      "source_url": source_url,
+      "company_hint": company_hint or ""
+    }
+
+    resp = client.responses.create(
+        model=model_name,
+        temperature=0.1,
+        response_format={"type": "json_schema", "json_schema": schema},
+        input=[{
+            "role": "system",
+            "content": system_msg
+        },{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": json.dumps(user_payload)},
+                {"type": "input_file", "file_id": f.id}
+            ]
+        }]
+    )
+    # Responses API convenience:
+    text = resp.output_text or ""
+    return json.loads(text)
+
 # ===============================
-# UI controls
+# Build display tables from JSON
+# ===============================
+def _build_pnl_table(json_obj):
+    meta = json_obj["meta"]
+    periods = meta["periods"]["pnl"]
+    cols = [
+        "Line item",
+        f"{periods['latest_label']} (INR Cr)",
+        f"{periods['prev_label']} (INR Cr)",
+        f"{periods['yoy_label']} (INR Cr)",
+        "%YoY","%QoQ"
+    ]
+    rows = []
+    # helper to lookup
+    def _get(name):
+        for r in json_obj["tables"]["pnl"]:
+            if r["name"].strip().lower() == name.strip().lower():
+                return r
+        return None
+
+    # ordered canonical rows first; then any extras
+    base_order = [
+        "Revenue from operations",
+        "Other income",
+        "Total income",
+        "Cost of materials consumed",
+        "Purchases of stock-in-trade",
+        "Changes in inventories of FG/WIP/stock-in-trade",
+        "Employee benefits expense",
+        "Other expenses",
+        "Finance costs",
+        "Depreciation and amortisation expense",
+        "Profit before tax (PBT)",
+        "Tax expense",
+        "Profit after tax (PAT)"
+    ]
+    seen = set()
+    def add_row(r):
+        if not r: return
+        seen.add(r["name"].lower())
+        cur, prev, yoy = r.get("latest"), r.get("prev"), r.get("yoy")
+        rows.append([
+            r["name"],
+            None if cur is None else round(cur, 2),
+            None if prev is None else round(prev, 2),
+            None if yoy is None else round(yoy, 2),
+            None if (cur is None or yoy is None or yoy == 0) else round(_pct(cur, yoy), 1),
+            None if (cur is None or prev is None or prev == 0) else round(_pct(cur, prev), 1)
+        ])
+
+    for name in base_order:
+        add_row(_get(name))
+
+    # add any additional rows the company reported
+    for r in json_obj["tables"]["pnl"]:
+        if r["name"].lower() not in seen:
+            add_row(r)
+
+    return pd.DataFrame(rows, columns=cols)
+
+def _build_balance_table(json_obj):
+    meta = json_obj["meta"]
+    periods = meta["periods"]["balance"]
+    cols = [
+        "Line item",
+        f"As at {periods['asof_latest']} (INR Cr)",
+        f"As at {periods['asof_prev']} (INR Cr)",
+        f"As at {periods['asof_yoy']} (INR Cr)"
+    ]
+    rows = []
+    for r in json_obj.get("tables", {}).get("balance", []):
+        rows.append([
+            r["name"],
+            None if r.get("asof_latest") is None else round(r.get("asof_latest"), 2),
+            None if r.get("asof_prev") is None else round(r.get("asof_prev"), 2),
+            None if r.get("asof_yoy") is None else round(r.get("asof_yoy"), 2),
+        ])
+    return pd.DataFrame(rows, columns=cols) if rows else None
+
+def _build_cashflow_table(json_obj):
+    meta = json_obj["meta"]
+    periods = meta["periods"]["cashflow"]
+    cols = [
+        "Line item",
+        f"{periods.get('latest_label','Latest')} (INR Cr)",
+        f"{periods.get('prev_label','Prev')} (INR Cr)",
+        f"{periods.get('yoy_label','YoY')} (INR Cr)"
+    ]
+    rows = []
+    for r in json_obj.get("tables", {}).get("cashflow", []):
+        rows.append([
+            r["name"],
+            None if r.get("latest") is None else round(r.get("latest"), 2),
+            None if r.get("prev") is None else round(r.get("prev"), 2),
+            None if r.get("yoy") is None else round(r.get("yoy"), 2),
+        ])
+    return pd.DataFrame(rows, columns=cols) if rows else None, periods.get("basis","")
+
+def _local_checks(json_obj):
+    """Re-run key tallies locally for extra safety; return list of warnings."""
+    warns = []
+
+    # Units sanity
+    unit_mult = float(json_obj["meta"].get("unit_to_inr_crore", 1.0))
+    if unit_mult <= 0 or unit_mult > 1000:
+        warns.append(f"Unusual unit_to_inr_crore: {unit_mult}")
+
+    # P&L Rev + Other = Total income
+    pnl = {r["name"].lower(): r for r in json_obj["tables"]["pnl"]}
+    rev = pnl.get("revenue from operations", {})
+    oth = pnl.get("other income", {})
+    tin = pnl.get("total income", {})
+    def chk(cur_rev, cur_oth, cur_ti):
+        if cur_rev is None or cur_oth is None or cur_ti is None:
+            return
+        tol = max(0.5, 0.005*max(abs(cur_ti),1))
+        if abs((cur_rev + cur_oth) - cur_ti) > tol:
+            warns.append(f"P&L: Revenue({cur_rev}) + Other({cur_oth}) != Total income({cur_ti})")
+    chk(rev.get("latest"), oth.get("latest"), tin.get("latest"))
+
+    # Balance Sheet Assets vs Equity+Liabilities, if provided
+    bal = {r["name"].lower(): r for r in json_obj.get("tables", {}).get("balance", [])}
+    ta = bal.get("total assets")
+    tel = bal.get("total equity and liabilities") or bal.get("total liabilities and equity")
+    if ta and tel:
+        for k in ["asof_latest","asof_prev","asof_yoy"]:
+            a = ta.get(k); b = tel.get(k)
+            if a is None or b is None: continue
+            tol = max(0.5, 0.005*max(abs(a),abs(b)))
+            if abs(a - b) > tol:
+                warns.append(f"Balance Sheet {k}: Total Assets({a}) vs Equity+Liabilities({b})")
+
+    # Cash flow, if provided
+    cf_list = json_obj.get("tables", {}).get("cashflow", [])
+    cf = {r["name"].lower(): r for r in cf_list}
+    cfo = cf.get("net cash from operating activities (cfo)") or cf.get("net cash from operating activities")
+    cfi = cf.get("net cash used in investing activities (cfi)") or cf.get("net cash used in investing activities") or cf.get("net cash from investing activities")
+    cff = cf.get("net cash from/(used in) financing activities (cff)") or cf.get("net cash from/(used in) financing activities")
+    net = cf.get("net increase/(decrease) in cash and cash equivalents") or cf.get("net change in cash and cash equivalents")
+    opn = cf.get("cash and cash equivalents at beginning of period") or cf.get("cash and cash equivalents at the beginning of the period")
+    cls = cf.get("cash and cash equivalents at end of period") or cf.get("cash and cash equivalents at the end of the period")
+
+    def getv(item, key):
+        return None if item is None else item.get(key)
+
+    if all([cfo, cfi, cff, net]):
+        calc = lambda key: None if any(v is None for v in [getv(cfo,key),getv(cfi,key),getv(cff,key)]) else (getv(cfo,key)+getv(cfi,key)+getv(cff,key))
+        for k in ["latest","prev","yoy"]:
+            if getv(net,k) is None: continue
+            val = calc(k)
+            if val is None: continue
+            tol = max(0.5, 0.02*max(abs(val),abs(getv(net,k))))
+            if abs(val - getv(net,k)) > tol:
+                warns.append(f"Cash Flow {k}: CFO+CFI+CFF={val} vs Net change={getv(net,k)}")
+
+    if all([opn, net, cls]):
+        for k in ["latest","prev","yoy"]:
+            if getv(opn,k) is None or getv(net,k) is None or getv(cls,k) is None: continue
+            tol = max(0.5, 0.02*max(abs(getv(opn,k)+getv(net,k)),abs(getv(cls,k))))
+            if abs(getv(opn,k) + getv(net,k) - getv(cls,k)) > tol:
+                warns.append(f"Cash bridge {k}: Opening+Net != Closing")
+
+    return warns
+
+# ===============================
+# Sidebar controls
 # ===============================
 with st.sidebar:
     st.header("⚙️ Controls")
     today = datetime.now().date()
-    # Your test case: 23-Oct-2025
     start_date = st.date_input("Start date", value=today - timedelta(days=1), max_value=today)
     end_date   = st.date_input("End date", value=today, max_value=today, min_value=start_date)
-    max_workers = st.slider("Parallel extracts", 1, 8, 3)
+
+    model_name = st.selectbox(
+        "OpenAI model",
+        ["gpt-4.1", "gpt-4.1-mini", "gpt-4o-mini"],
+        index=1
+    )
+    max_workers = st.slider("Parallel extracts", 1, 6, 3)
     max_items   = st.slider("Max announcements", 1, 200, 50)
-    run = st.button("🚀 Fetch & Extract (Deterministic)", type="primary")
+    show_json   = st.checkbox("Show raw JSON")
+    run = st.button("🚀 Fetch & Extract (OpenAI-only)", type="primary")
 
 # ===============================
 # Run
@@ -539,15 +572,17 @@ def worker(idx, row, urls):
     if not pdf_bytes:
         return idx, used_url, {"error": "Could not fetch a valid PDF."}
 
+    company = str(row.get(_first_col(pd.DataFrame([row]), ["SLONGNAME","SNAME","SC_NAME","COMPANYNAME"]) or "SLONGNAME") or "").strip()
+
     try:
-        parsed = extract_financials_from_pdf(pdf_bytes)
-        return idx, used_url, parsed
+        out = _openai_extract(pdf_bytes, used_url, company, model_name)
+        return idx, used_url, out
     except Exception as e:
-        return idx, used_url, {"error": f"Parse error: {e}"}
+        return idx, used_url, {"error": f"OpenAI extract error: {e}"}
 
 if run:
-    start_str, end_str = _fmt(start_date), _fmt(end_date)
-    with st.status("Fetching announcements…", expanded=True) as sbar:
+    start_str, end_str = _fmt_date(start_date), _fmt_date(end_date)
+    with st.status("Fetching announcements…", expanded=True):
         hits = fetch_bse_announcements_result(start_str, end_str)
         st.write(f"Matched rows (category='Result'): **{len(hits)}**")
         if hits.empty:
@@ -562,10 +597,11 @@ if run:
         urls = _candidate_urls(r)
         rows.append((r, urls))
 
-    st.subheader("📑 Deterministic Tables (per filing)")
+    st.subheader("📑 Extracted Statements (per filing)")
 
     def dl_button_bytes(label, data_bytes, file_name, key):
-        st.download_button(label, data=data_bytes, file_name=file_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=key)
+        st.download_button(label, data=data_bytes, file_name=file_name,
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=key)
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = [ex.submit(worker, i, r, urls) for i, (r, urls) in enumerate(rows)]
@@ -580,7 +616,7 @@ if run:
             title = f"{company or 'Unknown'} — {dt}  •  {subcat or 'N/A'}"
             with st.expander(title, expanded=False):
                 if headline:
-                    st.markdown(f"**Headline:** {_clean(headline)}")
+                    st.markdown(f"**Headline:** {headline}")
                 if pdf_url:
                     st.markdown(f"[PDF link]({pdf_url})")
 
@@ -588,59 +624,64 @@ if run:
                     st.error(result["error"])
                     continue
 
-                # Show P&L
-                if result.get("pnl_md"):
-                    st.markdown("### Consolidated Income Statement (Quarter)")
-                    st.markdown(result["pnl_md"])
-                    if result.get("pnl_issues"):
-                        st.warning("P&L checks:")
-                        for msg in result["pnl_issues"]:
-                            st.write("- " + msg)
-                else:
-                    st.info("Income Statement not detected.")
+                # Local checks
+                local_warns = _local_checks(result)
 
-                # Show Balance Sheet
-                if result.get("bal_md"):
+                # Build display tables
+                pnl_df     = _build_pnl_table(result)
+                bal_df     = _build_balance_table(result)
+                cash_df, cf_basis = _build_cashflow_table(result)
+
+                st.markdown("### Consolidated Income Statement (Quarter)")
+                st.markdown(_to_markdown(pnl_df))
+
+                if bal_df is not None:
                     st.markdown("### Consolidated Balance Sheet (Statement of Assets & Liabilities)")
-                    st.markdown(result["bal_md"])
-                    if result.get("bal_issues"):
-                        st.warning("Balance Sheet checks:")
-                        for msg in result["bal_issues"]:
-                            st.write("- " + msg)
+                    st.markdown(_to_markdown(bal_df))
                 else:
-                    st.info("Balance Sheet not detected.")
+                    st.info("Balance Sheet not detected or not disclosed in this PDF.")
 
-                # Show Cash Flow
-                if result.get("cash_md"):
-                    st.markdown("### Consolidated Cash Flow Statement")
-                    st.markdown(result["cash_md"])
-                    if result.get("cash_issues"):
-                        st.warning("Cash Flow checks:")
-                        for msg in result["cash_issues"]:
-                            st.write("- " + msg)
+                if cash_df is not None:
+                    st.markdown(f"### Consolidated Cash Flow Statement  \n*Basis detected: {cf_basis or 'unspecified'}*")
+                    st.markdown(_to_markdown(cash_df))
                 else:
-                    st.info("Cash Flow not detected.")
+                    st.info("Cash Flow not detected or not disclosed in this PDF.")
 
-                # Download Excel (per filing)
-                sheets = {}
+                # Show model's checks + our local warnings
+                m_checks = result.get("checks", {})
+                if any([m_checks.get("pnl"), m_checks.get("balance"), m_checks.get("cashflow"), local_warns]):
+                    st.warning("Validation checks:")
+                    for section in ["pnl","balance","cashflow"]:
+                        for msg in (m_checks.get(section) or []):
+                            st.write(f"- {section.upper()}: {msg}")
+                    for msg in local_warns:
+                        st.write(f"- LOCAL: {msg}")
+
+                # Download Excel
                 meta = {
                     "source_pdf": pdf_url,
-                    "unit_multiplier_to_INR_crore": result.get("unit_multiplier_to_INR_crore"),
-                    "pnl_issues": "; ".join(result.get("pnl_issues", [])),
-                    "bal_issues": "; ".join(result.get("bal_issues", [])),
-                    "cash_issues": "; ".join(result.get("cash_issues", [])),
+                    "basis": result["meta"].get("basis"),
+                    "unit_detected": result["meta"].get("unit_detected"),
+                    "unit_to_inr_crore": result["meta"].get("unit_to_inr_crore"),
+                    "pnl_checks_model": "; ".join(m_checks.get("pnl", [])),
+                    "balance_checks_model": "; ".join(m_checks.get("balance", [])),
+                    "cashflow_checks_model": "; ".join(m_checks.get("cashflow", [])),
                 }
-                sheets["README"] = pd.DataFrame([meta])
-                if isinstance(result.get("pnl_sheet"), pd.DataFrame):
-                    sheets["Consolidated PnL (Quarter)"] = result["pnl_sheet"]
-                if isinstance(result.get("bal_sheet"), pd.DataFrame):
-                    sheets["Consolidated Balance Sheet"] = result["bal_sheet"]
-                if isinstance(result.get("cash_sheet"), pd.DataFrame):
-                    sheets["Consolidated Cash Flow"] = result["cash_sheet"]
+                sheets = {"README": pd.DataFrame([meta]), "Consolidated PnL (Quarter)": pnl_df}
+                if bal_df is not None:
+                    sheets["Consolidated Balance Sheet"] = bal_df
+                if cash_df is not None:
+                    sheets["Consolidated Cash Flow"] = cash_df
 
                 xlsx_bytes = _xlsx_bytes(sheets)
                 dl_button_bytes("💾 Download Excel", xlsx_bytes,
                                 f"{_slug(company)}_{_slug(dt)}.xlsx",
                                 key=f"dl_{i}")
+
+                # Optional: show raw JSON
+                if show_json:
+                    st.divider()
+                    st.caption("Raw JSON returned by the model")
+                    st.json(result)
 else:
-    st.info("Set your date range (e.g., **23 Oct 2025** for your test) and click **Fetch & Extract (Deterministic)**.")
+    st.info("Pick your date range (e.g., **23 Oct 2025**) and click **Fetch & Extract (OpenAI-only)**.")
