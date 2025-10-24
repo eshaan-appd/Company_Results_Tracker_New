@@ -1,0 +1,21 @@
+# --- Core (app + API) ---
+streamlit>=1.36,<2
+openai>=1.51,<2
+requests>=2.32,<3
+pandas>=2.2,<3
+numpy>=1.26,<3
+
+# --- HTML table parsing for pd.read_html() ---
+lxml>=4.9.3,<6
+beautifulsoup4>=4.12,<5
+html5lib>=1.1,<2
+
+# --- PDF parsing (recommended; enables table extraction from PDFs) ---
+pdfplumber>=0.11,<0.12
+
+# --- High-DPI PDF rasterization (for image-only PDFs; optional but helpful) ---
+pymupdf>=1.24,<2   # import name: fitz
+
+# --- OCR pipeline (optional; only if you toggle “Improve image PDFs”) ---
+pillow>=10.4,<12
+pytesseract>=0.3.10,<0.4
