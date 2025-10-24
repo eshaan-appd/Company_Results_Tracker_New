@@ -1,7 +1,7 @@
 # app.py
 # Streamlit app that extracts Consolidated P&L (Quarter), Balance Sheet, and Cash Flow
 # from BSE PDFs using ONLY OpenAI (no Camelot/Ghostscript). The model returns strict JSON
-# under a schema; we verify tallies locally and render markdown + Excel.
+# via a function tool; we verify tallies locally and render markdown + Excel.
 
 import os, re, io, time, json, tempfile
 from datetime import datetime, timedelta
@@ -21,7 +21,7 @@ st.set_page_config(page_title="📈 BSE Results — OpenAI-only Extractor", layo
 st.title("📈 BSE Results — OpenAI-only Extractor (INR Cr)")
 
 st.caption(
-    "Fetch BSE ‘Result’ announcements → upload the PDF to OpenAI → model returns strict JSON for "
+    "Fetch BSE ‘Result’ announcements → upload each PDF to OpenAI → model returns strict JSON for "
     "Consolidated P&L (Quarter), Balance Sheet, and Cash Flow. We re-check tallies locally."
 )
 
@@ -174,7 +174,7 @@ def _download_pdf(url: str, timeout=25) -> bytes:
     return r.content
 
 # ===============================
-# OpenAI — strict JSON extractor
+# OpenAI client and schema/tools
 # ===============================
 def _client():
     key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
@@ -184,174 +184,202 @@ def _client():
     return OpenAI(api_key=key)
 
 def _schema():
-    # JSON Schema demanding exact structure. Model MUST fill it.
+    # Pure JSON Schema used as function.parameters
     return {
-      "name": "FinancialExtraction",
-      "strict": True,
-      "schema": {
-        "type": "object",
-        "properties": {
-          "meta": {
-            "type": "object",
-            "properties": {
-              "source_url": {"type": "string"},
-              "company": {"type": "string"},
-              "basis": {"type": "string", "enum": ["Consolidated","Standalone"]},
-              "unit_detected": {"type": "string"},
-              "unit_to_inr_crore": {"type": "number"},
-              "periods": {
+      "type": "object",
+      "properties": {
+        "meta": {
+          "type": "object",
+          "properties": {
+            "source_url": {"type": "string"},
+            "company": {"type": "string"},
+            "basis": {"type": "string", "enum": ["Consolidated","Standalone"]},
+            "unit_detected": {"type": "string"},
+            "unit_to_inr_crore": {"type": "number"},
+            "periods": {
+              "type": "object",
+              "properties": {
+                "pnl": {
+                  "type": "object",
+                  "properties": {
+                    "latest_label": {"type": "string"},
+                    "prev_label":   {"type": "string"},
+                    "yoy_label":    {"type": "string"}
+                  },
+                  "required": ["latest_label","prev_label","yoy_label"]
+                },
+                "balance": {
+                  "type": "object",
+                  "properties": {
+                    "asof_latest": {"type": "string"},
+                    "asof_prev":   {"type": "string"},
+                    "asof_yoy":    {"type": "string"}
+                  },
+                  "required": ["asof_latest","asof_prev","asof_yoy"]
+                },
+                "cashflow": {
+                  "type": "object",
+                  "properties": {
+                    "basis": {"type": "string", "enum": ["quarter","ytd","h1","9m","year"]},
+                    "latest_label": {"type": "string"},
+                    "prev_label":   {"type": "string"},
+                    "yoy_label":    {"type": "string"}
+                  },
+                  "required": ["basis","latest_label"]
+                }
+              },
+              "required": ["pnl","balance","cashflow"]
+            }
+          },
+          "required": ["source_url","basis","unit_detected","unit_to_inr_crore","periods"]
+        },
+        "tables": {
+          "type": "object",
+          "properties": {
+            "pnl": {
+              "type": "array",
+              "items": {
                 "type": "object",
                 "properties": {
-                  "pnl": {
+                  "name": {"type": "string"},
+                  "latest": {"type": "number"},
+                  "prev":   {"type": ["number","null"]},
+                  "yoy":    {"type": ["number","null"]},
+                  "cell_refs": {
                     "type": "object",
                     "properties": {
-                      "latest_label": {"type": "string"},
-                      "prev_label":   {"type": "string"},
-                      "yoy_label":    {"type": "string"}
-                    },
-                    "required": ["latest_label","prev_label","yoy_label"]
-                  },
-                  "balance": {
-                    "type": "object",
-                    "properties": {
-                      "asof_latest": {"type": "string"},
-                      "asof_prev":   {"type": "string"},
-                      "asof_yoy":    {"type": "string"}
-                    },
-                    "required": ["asof_latest","asof_prev","asof_yoy"]
-                  },
-                  "cashflow": {
-                    "type": "object",
-                    "properties": {
-                      "basis": {"type": "string", "enum": ["quarter","ytd","h1","9m","year"]},
-                      "latest_label": {"type": "string"},
-                      "prev_label":   {"type": "string"},
-                      "yoy_label":    {"type": "string"}
-                    },
-                    "required": ["basis","latest_label"]
+                      "latest": {"type": "string"},
+                      "prev":   {"type": "string"},
+                      "yoy":    {"type": "string"}
+                    }
                   }
                 },
-                "required": ["pnl","balance","cashflow"]
+                "required": ["name","latest"]
               }
             },
-            "required": ["source_url","basis","unit_detected","unit_to_inr_crore","periods"]
-          },
-          "tables": {
-            "type": "object",
-            "properties": {
-              "pnl": {
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "name": {"type": "string"},
-                    "latest": {"type": "number"},
-                    "prev":   {"type": ["number","null"]},
-                    "yoy":    {"type": ["number","null"]},
-                    "cell_refs": {
-                      "type": "object",
-                      "properties": {
-                        "latest": {"type": "string"},
-                        "prev":   {"type": "string"},
-                        "yoy":    {"type": "string"}
-                      }
-                    }
-                  },
-                  "required": ["name","latest"]
-                }
-              },
-              "balance": {
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "name": {"type":"string"},
-                    "asof_latest": {"type":"number"},
-                    "asof_prev":   {"type":["number","null"]},
-                    "asof_yoy":    {"type":["number","null"]},
-                    "cell_refs": {"type":"object"}
-                  },
-                  "required": ["name","asof_latest"]
-                }
-              },
-              "cashflow": {
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "name": {"type":"string"},
-                    "latest": {"type":"number"},
-                    "prev":   {"type":["number","null"]},
-                    "yoy":    {"type":["number","null"]},
-                    "cell_refs": {"type":"object"}
-                  },
-                  "required": ["name","latest"]
-                }
+            "balance": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {"type":"string"},
+                  "asof_latest": {"type":"number"},
+                  "asof_prev":   {"type":["number","null"]},
+                  "asof_yoy":    {"type":["number","null"]},
+                  "cell_refs": {"type":"object"}
+                },
+                "required": ["name","asof_latest"]
               }
             },
-            "required": ["pnl"]
+            "cashflow": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {"type":"string"},
+                  "latest": {"type":"number"},
+                  "prev":   {"type":["number","null"]},
+                  "yoy":    {"type":["number","null"]},
+                  "cell_refs": {"type":"object"}
+                },
+                "required": ["name","latest"]
+              }
+            }
           },
-          "checks": {
-            "type": "object",
-            "properties": {
-              "pnl": {"type":"array","items":{"type":"string"}},
-              "balance": {"type":"array","items":{"type":"string"}},
-              "cashflow": {"type":"array","items":{"type":"string"}}
-            },
-            "required": ["pnl","balance","cashflow"]
-          },
-          "notes": {"type": "array", "items": {"type": "string"}}
+          "required": ["pnl"]
         },
-        "required": ["meta","tables","checks"]
-      }
+        "checks": {
+          "type": "object",
+          "properties": {
+            "pnl": {"type":"array","items":{"type":"string"}},
+            "balance": {"type":"array","items":{"type":"string"}},
+            "cashflow": {"type":"array","items":{"type":"string"}}
+          },
+          "required": ["pnl","balance","cashflow"]
+        },
+        "notes": {"type": "array", "items": {"type": "string"}}
+      },
+      "required": ["meta","tables","checks"]
     }
+
+def _tool_args_from_response(resp, tool_name: str):
+    """
+    Works across SDK versions: convert the Response to plain JSON and
+    pull arguments from the tool call with the given name.
+    """
+    try:
+        data = json.loads(resp.model_dump_json())
+    except Exception:
+        data = resp
+
+    # Responses API shape: output -> [ message ] -> content -> [ parts... ]
+    out = data.get("output") or []
+    for msg in out:
+        for part in msg.get("content", []) or []:
+            if part.get("type") == "tool_call" and part.get("name") == tool_name:
+                args = part.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        return json.loads(args)
+                    except Exception:
+                        pass
+                return args
+
+    # Some older variants nest under "tool_calls"
+    for msg in out:
+        for part in msg.get("content", []) or []:
+            tool_calls = part.get("tool_calls") or []
+            for tc in tool_calls:
+                if tc.get("name") == tool_name:
+                    args = tc.get("arguments")
+                    if isinstance(args, str):
+                        return json.loads(args)
+                    return args
+    raise RuntimeError("Tool call arguments not found in response.")
 
 def _openai_extract(pdf_bytes: bytes, source_url: str, company_hint: str, model_name: str):
     client = _client()
-    # upload file
+
+    # Upload PDF for the model to read
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_bytes)
         tmp.flush()
-        f = client.files.create(file=open(tmp.name, "rb"), purpose="assistants")
+        file_obj = client.files.create(file=open(tmp.name, "rb"), purpose="assistants")
 
     schema = _schema()
 
+    tool_name = "submit_financial_extraction"
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "description": (
+                "Return the extracted statements using the provided schema. "
+                "HARD RULES:\n"
+                "• P&L must use ONLY the three 'Quarter ended' columns: latest, previous quarter, same quarter last year.\n"
+                "• Balance Sheet must use 'As at' columns (latest, previous, YoY if present).\n"
+                "• Cash Flow must state its basis (quarter/ytd/h1/9m/year) and keep periods consistent.\n"
+                "• Detect units (₹ in Crore/Lakh/Million/Billion) and normalize to INR Crore.\n"
+                "• Provide cell_refs like 'row label ~ column header' for traceability.\n"
+                "• Run your own checks; put messages into checks.pnl/balance/cashflow."
+            ),
+            "parameters": schema
+        }
+    }]
+
     system_msg = (
-        "You are a meticulous financial table extractor. Read the attached BSE results PDF and output ONLY JSON "
-        "matching the provided schema. Prefer CONSOLIDATED; if a statement is missing in consolidated but present in "
-        "standalone, set basis='Standalone' for that statement and use it.\n\n"
-        "IMPORTANT RULES (do not violate):\n"
-        "1) INCOME STATEMENT: Use the three 'QUARTER ENDED' columns ONLY (latest quarter, immediately preceding quarter, same quarter last year). "
-        "   Ignore any 'Six months ended', 'Nine months ended', or 'Year ended' columns for the P&L table.\n"
-        "2) BALANCE SHEET: Use the 'AS AT' columns (pick latest and nearest previous 'as at' dates; include a YoY 'as at' if present).\n"
-        "3) CASH FLOW: Detect the basis (quarter / YTD / H1 / 9M / year) as printed for the section and use 1–3 periods accordingly.\n"
-        "4) UNITS: Detect the unit hint text (e.g., '₹ in Crores', '₹ in Lakhs', '₹ in Million/Billion') and normalize ALL numeric outputs to INR Crore. "
-        "   Set unit_to_inr_crore appropriately: Crore=1, Lakh=0.01, Mn=0.1, Bn=100.\n"
-        "5) LINE ITEMS: Use exact company labels where possible but map to these canonical rows when present:\n"
-        "   - Revenue from operations\n   - Other income\n   - Total income\n"
-        "   - Cost of materials consumed; Purchases of stock-in-trade; Changes in inventories of FG/WIP/stock-in-trade\n"
-        "   - Employee benefits expense; Other expenses\n"
-        "   - Finance costs; Depreciation and amortisation expense\n"
-        "   - Profit before tax (PBT); Tax expense; Profit after tax (PAT)\n"
-        "6) PROVIDE cell_refs strings like 'row label ~ col header' to show where each number came from.\n"
-        "7) TALLY before you return:\n"
-        "   - P&L: check (Revenue + Other income) ≈ Total income (tolerance: max(0.5 Cr, 0.5%)).\n"
-        "   - Balance Sheet: Total Assets ≈ Total Equity & Liabilities (same tolerance).\n"
-        "   - Cash Flow: CFO + CFI + CFF ≈ Net change; Opening + Net change ≈ Closing (tolerance: max(0.5 Cr, 2%)).\n"
-        "   Put any failures as human-readable strings into the respective checks arrays.\n"
-        "8) NEVER fabricate numbers. If a row is missing, omit it. If a comparator period is missing, set that field to null.\n"
-        "Output ONLY JSON — no markdown, no prose."
+        "You are a meticulous financial table extractor. Output only via the function tool call. "
+        "Never include prose. Never mix quarter columns with H1/YTD/Year. "
+        "Prefer CONSOLIDATED; if a consolidated section is missing but standalone exists, set basis='Standalone' for that section."
     )
 
-    user_payload = {
-      "source_url": source_url,
-      "company_hint": company_hint or ""
-    }
+    user_payload = {"source_url": source_url, "company_hint": company_hint or ""}
 
     resp = client.responses.create(
         model=model_name,
         temperature=0.1,
-        response_format={"type": "json_schema", "json_schema": schema},
+        tools=tools,
+        tool_choice={"type": "function", "function": {"name": tool_name}},
         input=[{
             "role": "system",
             "content": system_msg
@@ -359,13 +387,14 @@ def _openai_extract(pdf_bytes: bytes, source_url: str, company_hint: str, model_
             "role": "user",
             "content": [
                 {"type": "input_text", "text": json.dumps(user_payload)},
-                {"type": "input_file", "file_id": f.id}
+                {"type": "input_file", "file_id": file_obj.id}
             ]
         }]
     )
-    # Responses API convenience:
-    text = resp.output_text or ""
-    return json.loads(text)
+
+    # Extract validated JSON args
+    args = _tool_args_from_response(resp, tool_name)
+    return args  # dict matching the schema
 
 # ===============================
 # Build display tables from JSON
@@ -381,14 +410,12 @@ def _build_pnl_table(json_obj):
         "%YoY","%QoQ"
     ]
     rows = []
-    # helper to lookup
     def _get(name):
         for r in json_obj["tables"]["pnl"]:
             if r["name"].strip().lower() == name.strip().lower():
                 return r
         return None
 
-    # ordered canonical rows first; then any extras
     base_order = [
         "Revenue from operations",
         "Other income",
@@ -420,8 +447,6 @@ def _build_pnl_table(json_obj):
 
     for name in base_order:
         add_row(_get(name))
-
-    # add any additional rows the company reported
     for r in json_obj["tables"]["pnl"]:
         if r["name"].lower() not in seen:
             add_row(r)
@@ -470,12 +495,10 @@ def _local_checks(json_obj):
     """Re-run key tallies locally for extra safety; return list of warnings."""
     warns = []
 
-    # Units sanity
     unit_mult = float(json_obj["meta"].get("unit_to_inr_crore", 1.0))
     if unit_mult <= 0 or unit_mult > 1000:
         warns.append(f"Unusual unit_to_inr_crore: {unit_mult}")
 
-    # P&L Rev + Other = Total income
     pnl = {r["name"].lower(): r for r in json_obj["tables"]["pnl"]}
     rev = pnl.get("revenue from operations", {})
     oth = pnl.get("other income", {})
@@ -488,7 +511,6 @@ def _local_checks(json_obj):
             warns.append(f"P&L: Revenue({cur_rev}) + Other({cur_oth}) != Total income({cur_ti})")
     chk(rev.get("latest"), oth.get("latest"), tin.get("latest"))
 
-    # Balance Sheet Assets vs Equity+Liabilities, if provided
     bal = {r["name"].lower(): r for r in json_obj.get("tables", {}).get("balance", [])}
     ta = bal.get("total assets")
     tel = bal.get("total equity and liabilities") or bal.get("total liabilities and equity")
@@ -500,7 +522,6 @@ def _local_checks(json_obj):
             if abs(a - b) > tol:
                 warns.append(f"Balance Sheet {k}: Total Assets({a}) vs Equity+Liabilities({b})")
 
-    # Cash flow, if provided
     cf_list = json_obj.get("tables", {}).get("cashflow", [])
     cf = {r["name"].lower(): r for r in cf_list}
     cfo = cf.get("net cash from operating activities (cfo)") or cf.get("net cash from operating activities")
@@ -572,6 +593,7 @@ def worker(idx, row, urls):
     if not pdf_bytes:
         return idx, used_url, {"error": "Could not fetch a valid PDF."}
 
+    # best-effort company hint
     company = str(row.get(_first_col(pd.DataFrame([row]), ["SLONGNAME","SNAME","SC_NAME","COMPANYNAME"]) or "SLONGNAME") or "").strip()
 
     try:
@@ -678,7 +700,6 @@ if run:
                                 f"{_slug(company)}_{_slug(dt)}.xlsx",
                                 key=f"dl_{i}")
 
-                # Optional: show raw JSON
                 if show_json:
                     st.divider()
                     st.caption("Raw JSON returned by the model")
