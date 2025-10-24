@@ -535,3 +535,112 @@ def worker(idx, row, urls):
                 pdf_bytes, used_url = data, u
                 break
         except Exception:
+            continue
+    if not pdf_bytes:
+        return idx, used_url, {"error": "Could not fetch a valid PDF."}
+
+    try:
+        parsed = extract_financials_from_pdf(pdf_bytes)
+        return idx, used_url, parsed
+    except Exception as e:
+        return idx, used_url, {"error": f"Parse error: {e}"}
+
+if run:
+    start_str, end_str = _fmt(start_date), _fmt(end_date)
+    with st.status("Fetching announcements…", expanded=True) as sbar:
+        hits = fetch_bse_announcements_result(start_str, end_str)
+        st.write(f"Matched rows (category='Result'): **{len(hits)}**")
+        if hits.empty:
+            st.stop()
+
+    if len(hits) > max_items:
+        hits = hits.head(max_items)
+
+    nm, subcol = _pick_company_cols(hits)
+    rows = []
+    for _, r in hits.iterrows():
+        urls = _candidate_urls(r)
+        rows.append((r, urls))
+
+    st.subheader("📑 Deterministic Tables (per filing)")
+
+    def dl_button_bytes(label, data_bytes, file_name, key):
+        st.download_button(label, data=data_bytes, file_name=file_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=key)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(worker, i, r, urls) for i, (r, urls) in enumerate(rows)]
+        for fut in as_completed(futs):
+            i, pdf_url, result = fut.result()
+            r = rows[i][0]
+            company = str(r.get(nm) or "").strip()
+            dt = str(r.get("NEWS_DT") or "").strip()
+            subcat = str(r.get(subcol) or "").strip()
+            headline = str(r.get("HEADLINE") or "").strip()
+
+            title = f"{company or 'Unknown'} — {dt}  •  {subcat or 'N/A'}"
+            with st.expander(title, expanded=False):
+                if headline:
+                    st.markdown(f"**Headline:** {_clean(headline)}")
+                if pdf_url:
+                    st.markdown(f"[PDF link]({pdf_url})")
+
+                if "error" in result:
+                    st.error(result["error"])
+                    continue
+
+                # Show P&L
+                if result.get("pnl_md"):
+                    st.markdown("### Consolidated Income Statement (Quarter)")
+                    st.markdown(result["pnl_md"])
+                    if result.get("pnl_issues"):
+                        st.warning("P&L checks:")
+                        for msg in result["pnl_issues"]:
+                            st.write("- " + msg)
+                else:
+                    st.info("Income Statement not detected.")
+
+                # Show Balance Sheet
+                if result.get("bal_md"):
+                    st.markdown("### Consolidated Balance Sheet (Statement of Assets & Liabilities)")
+                    st.markdown(result["bal_md"])
+                    if result.get("bal_issues"):
+                        st.warning("Balance Sheet checks:")
+                        for msg in result["bal_issues"]:
+                            st.write("- " + msg)
+                else:
+                    st.info("Balance Sheet not detected.")
+
+                # Show Cash Flow
+                if result.get("cash_md"):
+                    st.markdown("### Consolidated Cash Flow Statement")
+                    st.markdown(result["cash_md"])
+                    if result.get("cash_issues"):
+                        st.warning("Cash Flow checks:")
+                        for msg in result["cash_issues"]:
+                            st.write("- " + msg)
+                else:
+                    st.info("Cash Flow not detected.")
+
+                # Download Excel (per filing)
+                sheets = {}
+                meta = {
+                    "source_pdf": pdf_url,
+                    "unit_multiplier_to_INR_crore": result.get("unit_multiplier_to_INR_crore"),
+                    "pnl_issues": "; ".join(result.get("pnl_issues", [])),
+                    "bal_issues": "; ".join(result.get("bal_issues", [])),
+                    "cash_issues": "; ".join(result.get("cash_issues", [])),
+                }
+                sheets["README"] = pd.DataFrame([meta])
+                if isinstance(result.get("pnl_sheet"), pd.DataFrame):
+                    sheets["Consolidated PnL (Quarter)"] = result["pnl_sheet"]
+                if isinstance(result.get("bal_sheet"), pd.DataFrame):
+                    sheets["Consolidated Balance Sheet"] = result["bal_sheet"]
+                if isinstance(result.get("cash_sheet"), pd.DataFrame):
+                    sheets["Consolidated Cash Flow"] = result["cash_sheet"]
+
+                xlsx_bytes = _xlsx_bytes(sheets)
+                dl_button_bytes("💾 Download Excel", xlsx_bytes,
+                                f"{_slug(company)}_{_slug(dt)}.xlsx",
+                                key=f"dl_{i}")
+else:
+    st.info("Set your date range (e.g., **23 Oct 2025** for your test) and click **Fetch & Extract (Deterministic)**.")
